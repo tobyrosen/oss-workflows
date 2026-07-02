@@ -32,6 +32,10 @@ name: Release
 
 on:
   workflow_call:
+    secrets:
+      MRFIXCODE_TOKEN:
+        description: "Classic PAT (repo+workflow) that authors release-please PRs/tags as MrFixCode — the maintenance identity per the authorship split. Optional: absent, release-please falls back to github.token (PRs author as github-actions[bot]). Callers pass it via `secrets: inherit` + a repo/org Actions secret. Side benefit: PAT-created Release PRs DO trigger CI workflows (github.token ones don't), which removes the awaiting-approval quirk."
+        required: false
     inputs:
       profile:
         description: "Release profile: claude-skill | mcp | standalone-software | web-app | json-schema"
@@ -64,7 +68,9 @@ jobs:
         id: rp
         uses: googleapis/release-please-action@v4
         with:
-          token: ${{ github.token }}
+          # MrFixCode PAT when provided (release plumbing = maintenance identity);
+          # falls back to the ephemeral github.token when the secret is absent.
+          token: ${{ secrets.MRFIXCODE_TOKEN || github.token }}
           config-file: ${{ inputs['config-file'] }}
           manifest-file: ${{ inputs['manifest-file'] }}
 
