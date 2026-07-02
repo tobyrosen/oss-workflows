@@ -1,0 +1,139 @@
+# Reusable RELEASE workflow (single source of truth)
+# Lives at tobyrosen/oss-workflows/.github/workflows/release.yml. Each repo
+# calls it via a thin caller:
+#
+#   jobs:
+#     release:
+#       uses: tobyrosen/oss-workflows/.github/workflows/release.yml@v1
+#       with:
+#         profile: standalone-software
+#       secrets: inherit
+#
+# Implements the approved public-software release standard:
+#   - release-please reads Conventional Commits and keeps a Release PR open with
+#     the pending version bump + changelog. NO tag/Release is cut until that PR
+#     is merged. Release PRs are NOT auto-merged here — merging is the owner gate.
+#   - Merging the Release PR is itself a push to main, which re-runs this workflow;
+#     release-please then creates the tag + GitHub Release (release_created=true).
+#   - On a created release, profile-appropriate assets are attached. GitHub always
+#     auto-attaches source archives, so only profiles whose product IS a bundle
+#     (claude-skill / json-schema / mcp) add an extra versioned asset + SHA256SUMS.
+#     standalone-software / web-app ship the auto source archive only.
+#   - GitHub-only: no PyPI/npm/registry publish (deferred until explicitly approved).
+#
+# Callers pin @v1 (rolling major tag). To ship a change here, move the v1 tag to
+# the new main commit after merge — the same convention as ci.yml@v1.
+#
+# NOTE: hyphenated inputs (config-file, manifest-file) must be read with bracket
+# notation in expressions — inputs['config-file'] — because dot notation would
+# parse the hyphen as a minus operator.
+
+name: Release
+
+on:
+  workflow_call:
+    inputs:
+      profile:
+        description: "Release profile: claude-skill | mcp | standalone-software | web-app | json-schema"
+        type: string
+        required: false
+        default: standalone-software
+      config-file:
+        description: "release-please config path"
+        type: string
+        required: false
+        default: release-please-config.json
+      manifest-file:
+        description: "release-please manifest path"
+        type: string
+        required: false
+        default: .release-please-manifest.json
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # create the tag + GitHub Release; commit changelog/version bumps
+      pull-requests: write   # open/update the Release PR
+      issues: write          # manage autorelease labels
+    outputs:
+      release_created: ${{ steps.rp.outputs.release_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - name: Run release-please
+        id: rp
+        uses: googleapis/release-please-action@v4
+        with:
+          token: ${{ github.token }}
+          config-file: ${{ inputs['config-file'] }}
+          manifest-file: ${{ inputs['manifest-file'] }}
+
+  # Runs ONLY on a freshly created release. Attaches the profile-appropriate
+  # versioned asset + SHA256SUMS. standalone-software / web-app add nothing here
+  # (GitHub's auto source archive is their canonical asset).
+  assets:
+    needs: release-please
+    if: needs.release-please.outputs.release_created == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write        # upload release assets
+    env:
+      GH_TOKEN: ${{ github.token }}
+      PROFILE: ${{ inputs.profile }}
+      TAG: ${{ needs.release-please.outputs.tag_name }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.release-please.outputs.tag_name }}
+      - name: Build and upload profile assets
+        run: |
+          set -euo pipefail
+          repo="${GITHUB_REPOSITORY##*/}"
+          stage="${repo}-${TAG}"
+
+          # Attach files to the release and generate SHA256SUMS over them.
+          upload() {
+            sha256sum "$@" > SHA256SUMS
+            gh release upload "$TAG" "$@" SHA256SUMS --clobber
+          }
+
+          case "$PROFILE" in
+            claude-skill)
+              mkdir -p "$stage"
+              for f in SKILL.md README.md LICENSE AGENTS.md version.txt; do
+                [ -f "$f" ] && cp "$f" "$stage"/
+              done
+              [ -d assets ] && cp -r assets "$stage"/
+              [ -d examples ] && cp -r examples "$stage"/
+              zip -r "${stage}.zip" "$stage" >/dev/null
+              upload "${stage}.zip"
+              ;;
+            json-schema)
+              schema=""
+              for f in schema/*.schema.json; do
+                [ -e "$f" ] && { schema="$f"; break; }
+              done
+              if [ -z "$schema" ]; then
+                echo "json-schema profile: no schema/*.schema.json found" >&2
+                exit 1
+              fi
+              cp "$schema" "${stage}.json"
+              upload "${stage}.json"
+              ;;
+            mcp)
+              mkdir -p "$stage"
+              for f in README.md LICENSE AGENTS.md version.txt mcp-server.json package.json pyproject.toml; do
+                [ -f "$f" ] && cp "$f" "$stage"/
+              done
+              [ -d docs ] && cp -r docs "$stage"/
+              [ -d src ] && cp -r src "$stage"/
+              zip -r "${stage}.zip" "$stage" >/dev/null
+              upload "${stage}.zip"
+              ;;
+            standalone-software|web-app)
+              echo "Profile '$PROFILE': GitHub source archive is auto-attached; no extra assets by default."
+              ;;
+            *)
+              echo "Unknown profile '$PROFILE' — attaching no extra assets." >&2
+              ;;
+          esac
