@@ -253,8 +253,19 @@ jobs:
     if: github.event_name == 'pull_request'
     steps:
       - uses: actions/checkout@v6
+      # Repo-level allowlist (osv-scanner.toml at repo root) must be passed via
+      # --config to apply GLOBALLY: auto-discovered configs are directory-local
+      # and never reach nested lockfiles (e.g. src-tauri/Cargo.lock). Entries
+      # require a reason + owner review date. (Fixed 2026-08-04; mirrors the
+      # fleet-ci central-floor+appendix fix.)
+      - name: Prepare OSV-Scanner config
+        run: |
+          if [ ! -f "$GITHUB_WORKSPACE/osv-scanner.toml" ]; then
+            echo "# no repo-level allowlist" > "$GITHUB_WORKSPACE/osv-scanner.toml"
+          fi
       - uses: google/osv-scanner-action/osv-scanner-action@v2.3.8
         with:
           scan-args: |-
             --recursive
+            --config /github/workspace/osv-scanner.toml
             ./
