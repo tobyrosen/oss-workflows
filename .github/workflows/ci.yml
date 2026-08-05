@@ -269,3 +269,40 @@ jobs:
             --recursive
             --config /github/workspace/osv-scanner.toml
             ./
+
+  # Session-link hygiene — BLOCKING. Claude sessions must not leak
+  # Claude-Session trailers / claude.ai/code URLs into public commit history
+  # (fleet rule, Toby 2026-07-31). PR-only, like dependency-scan.
+  session-links:
+    # Cancel superseded PR runs (cost cut): group per repo+ref+job so a
+    # new push to the same PR ref cancels the in-flight run instead of
+    # billing it to completion. Scoped to pull_request only — main-push
+    # runs are never cancelled (downstream automation consumes them).
+    concurrency:
+      group: ci-session-links-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+      - name: Reject PR commits containing Claude session links
+        # SHAs land via env (not inline interpolation) per workflow-injection
+        # hygiene, and are format-checked before use in git commands.
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        run: |
+          case "$BASE_SHA$HEAD_SHA" in (*[!0-9a-f]*)
+            echo "::error::Unexpected SHA format"; exit 1;;
+          esac
+
+          if ! git cat-file -e "${BASE_SHA}^{commit}" 2>/dev/null; then
+            git fetch --no-tags --depth=1 origin "$BASE_SHA"
+          fi
+
+          if git log --format=%B "$BASE_SHA".."$HEAD_SHA" | grep -E 'Claude-Session:|claude\.ai/code/'; then
+            echo "::error::Commit message(s) include Claude session-link trailers. Rewrite the offending commit(s) locally with an interactive rebase and force-push the PR branch; these trailers must not reach public history."
+            exit 1
+          fi
