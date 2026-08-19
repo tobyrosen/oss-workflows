@@ -66,7 +66,7 @@ jobs:
     steps:
       - name: Run release-please
         id: rp
-        uses: googleapis/release-please-action@v4
+        uses: googleapis/release-please-action@5c625bfb5d1ff62eadeeb3772007f7f66fdcf071 # v4.4.1
         with:
           # MrFixCode PAT when provided (release plumbing = maintenance identity);
           # falls back to the ephemeral github.token when the secret is absent.
@@ -88,7 +88,7 @@ jobs:
       PROFILE: ${{ inputs.profile }}
       TAG: ${{ needs.release-please.outputs.tag_name }}
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
         with:
           ref: ${{ needs.release-please.outputs.tag_name }}
       - name: Build and upload profile assets
