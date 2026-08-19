@@ -13,7 +13,7 @@
 #   - JS/TS: build + npm test (if package.json)
 #   - Rust: cargo test + clippy (if Cargo.toml)
 #   - dependency-scan (OSV) on PRs
-#   - security-scan on PRs: Socket (blocking); Semgrep + Trivy (advisory)
+#   - security-scan on PRs: Socket + Semgrep (blocking)
 #
 # github.event_name inside a called workflow reflects the CALLER's event, so the
 # PR-only dependency-scan and security-scan gates still work.
@@ -42,7 +42,6 @@ jobs:
       python: ${{ steps.check.outputs.python }}
       js: ${{ steps.check.outputs.js }}
       rust: ${{ steps.check.outputs.rust }}
-      iac: ${{ steps.check.outputs.iac }}
     steps:
       - uses: actions/checkout@v6
       - id: check
@@ -61,12 +60,6 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
-          fi
-          iac_file=$(find . -maxdepth 3 -type d \( -name node_modules -o -name target \) -prune -o -type f \( -name 'Dockerfile*' -o -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o -name compose.yaml -o -name '*.tf' \) -print -quit)
-          if [ -n "$iac_file" ]; then
-            echo "iac=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "iac=false" >> "$GITHUB_OUTPUT"
           fi
 
   # Secrets scan — BLOCKING. The one security gate that always reds main.
@@ -282,9 +275,11 @@ jobs:
             --config /github/workspace/osv-scanner.toml
             ./
 
-  # Three fleet security layers share one PR-only job to avoid the per-job
-  # 1-minute billing minimum. Socket blocks; Semgrep and Trivy tune advisory.
+  # Two fleet security layers share one PR-only job to avoid the per-job
+  # 1-minute billing minimum. Socket blocks when configured; Semgrep blocks.
   # Socket free tier = 1,000 scans/mo, which is why this is PR-only.
+  # Semgrep blocking since 2026-08-19; Trivy config scan removed 2026-08-19
+  # (no IaC in fleet callers; VPS weekly image scan retained).
   security-scan:
     # Cancel superseded PR runs (cost cut): group per repo+ref+job so a
     # new push to the same PR ref cancels the in-flight run instead of
@@ -295,7 +290,7 @@ jobs:
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
     runs-on: ubuntu-latest
     needs: detect
-    if: github.event_name == 'pull_request'
+    if: github.event_name == 'pull_request' || github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     steps:
       - uses: actions/checkout@v7
       - name: Socket supply-chain scan (blocking when configured)
@@ -319,9 +314,18 @@ jobs:
             --repo="$repo_name" \
             --branch="$GITHUB_HEAD_REF" \
             .
-      # non-blocking during the tuning window; promote to blocking after ~2 weeks
-      # (decided Toby 2026-08-07, REVISIT 2026-08-21).
-      - name: Semgrep CE (SAST, advisory)
+      # BLOCKING since 2026-08-19 (Toby-approved) — ends the 2026-08-07 advisory
+      # tuning window. `--error` already exits non-zero on a finding; dropping
+      # continue-on-error is what turns that into a failed job.
+      #
+      # EXACTLY ONE rule is excluded, fleet-wide, by rule id:
+      #   yaml.github-actions.security.secrets-inherit.secrets-inherit
+      # Why: it fires on `secrets: inherit` in a caller's own workflow file, which
+      # is precisely how a fleet caller hands SOCKET_SECURITY_API_KEY to THIS
+      # shared workflow. It flags our own CI wiring, not the repo's code.
+      # Excluded by rule id rather than by path so every other finding under
+      # .github/workflows/ still blocks. REVISIT 2026-10-01.
+      - name: Semgrep CE (SAST, blocking)
         run: |
           pip install semgrep==1.172.0
           semgrep scan \
@@ -331,39 +335,13 @@ jobs:
             --config p/typescript \
             --config p/dockerfile \
             --config p/github-actions \
+            --exclude-rule yaml.github-actions.security.secrets-inherit.secrets-inherit \
             --exclude='**/.venv/**' \
             --exclude='**/node_modules/**' \
             --exclude='**/target/**' \
             --exclude='**/tests/fixtures/**' \
             --exclude='**/test/fixtures/**' \
             .
-        continue-on-error: true
-      # Pin-and-verify is standing process after Trivy's March 2026 release-pipeline compromise.
-      # No `trivy fs` here: OSV-Scanner in dependency-scan owns lockfile vulns.
-      # non-blocking during the tuning window; promote to blocking after ~2 weeks
-      # (decided Toby 2026-08-07, REVISIT 2026-08-21).
-      - name: Trivy config (IaC / Dockerfile misconfig, advisory)
-        if: needs.detect.outputs.iac == 'true'
-        run: |
-          VER=0.73.0
-          ARCHIVE="trivy_${VER}_Linux-64bit.tar.gz"
-          CHECKSUMS="trivy_${VER}_checksums.txt"
-          TRIVY_SHA256=2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b
-          RELEASE_URL="https://github.com/aquasecurity/trivy/releases/download/v${VER}"
-          curl -sSfL "${RELEASE_URL}/${ARCHIVE}" -o "$ARCHIVE"
-          curl -sSfL "${RELEASE_URL}/${CHECKSUMS}" -o "$CHECKSUMS"
-          published_sha=$(awk -v archive="$ARCHIVE" '$2 == archive { print $1 }' "$CHECKSUMS")
-          if [ "$published_sha" != "$TRIVY_SHA256" ]; then
-            echo "::error::Official Trivy checksum does not match the pinned SHA256"
-            exit 1
-          fi
-          if ! printf '%s  %s\n' "$published_sha" "$ARCHIVE" | sha256sum --check --strict -; then
-            echo "::error::Trivy archive SHA256 verification failed"
-            exit 1
-          fi
-          tar -xzf "$ARCHIVE" trivy
-          ./trivy config --exit-code 1 .
-        continue-on-error: true
 
   # Session-link hygiene — BLOCKING. Claude sessions must not leak
   # Claude-Session trailers / claude.ai/code URLs into public commit history
