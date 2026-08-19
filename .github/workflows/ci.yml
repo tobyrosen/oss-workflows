@@ -13,15 +13,20 @@
 #   - JS/TS: build + npm test (if package.json)
 #   - Rust: cargo test + clippy (if Cargo.toml)
 #   - dependency-scan (OSV) on PRs
+#   - security-scan on PRs: Socket (blocking); Semgrep + Trivy (advisory)
 #
 # github.event_name inside a called workflow reflects the CALLER's event, so the
-# PR-only dependency-scan gate still works. No repo secrets are used, so callers
-# do NOT need `secrets: inherit`.
+# PR-only dependency-scan and security-scan gates still work.
+# Callers that want the Socket scan need `secrets: inherit` (or to pass
+# SOCKET_SECURITY_API_KEY); everything else still needs no secrets.
 
 name: CI
 
 on:
   workflow_call:
+    secrets:
+      SOCKET_SECURITY_API_KEY:
+        required: false
 
 jobs:
   detect:
@@ -37,6 +42,7 @@ jobs:
       python: ${{ steps.check.outputs.python }}
       js: ${{ steps.check.outputs.js }}
       rust: ${{ steps.check.outputs.rust }}
+      iac: ${{ steps.check.outputs.iac }}
     steps:
       - uses: actions/checkout@v6
       - id: check
@@ -55,6 +61,12 @@ jobs:
             echo "rust=true" >> "$GITHUB_OUTPUT"
           else
             echo "rust=false" >> "$GITHUB_OUTPUT"
+          fi
+          iac_file=$(find . -maxdepth 3 -type d \( -name node_modules -o -name target \) -prune -o -type f \( -name 'Dockerfile*' -o -name 'docker-compose*.yml' -o -name 'docker-compose*.yaml' -o -name compose.yaml -o -name '*.tf' \) -print -quit)
+          if [ -n "$iac_file" ]; then
+            echo "iac=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "iac=false" >> "$GITHUB_OUTPUT"
           fi
 
   # Secrets scan — BLOCKING. The one security gate that always reds main.
@@ -269,6 +281,89 @@ jobs:
             --recursive
             --config /github/workspace/osv-scanner.toml
             ./
+
+  # Three fleet security layers share one PR-only job to avoid the per-job
+  # 1-minute billing minimum. Socket blocks; Semgrep and Trivy tune advisory.
+  # Socket free tier = 1,000 scans/mo, which is why this is PR-only.
+  security-scan:
+    # Cancel superseded PR runs (cost cut): group per repo+ref+job so a
+    # new push to the same PR ref cancels the in-flight run instead of
+    # billing it to completion. Scoped to pull_request only — main-push
+    # runs are never cancelled (the mrfixcode-gate consumes them).
+    concurrency:
+      group: ci-security-scan-${{ github.repository }}-${{ github.ref }}
+      cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+    runs-on: ubuntu-latest
+    needs: detect
+    if: github.event_name == 'pull_request'
+    steps:
+      - uses: actions/checkout@v7
+      - name: Socket supply-chain scan (blocking when configured)
+        env:
+          SOCKET_CLI_API_TOKEN: ${{ secrets.SOCKET_SECURITY_API_KEY }}
+        run: |
+          if [ -z "$SOCKET_CLI_API_TOKEN" ]; then
+            echo "Socket scan skipped — no SOCKET_SECURITY_API_KEY in caller context"
+            exit 0
+          fi
+          npm install --global socket@1.1.147
+          repo_name=${GITHUB_REPOSITORY#*/}
+          # --org: Socket-side org slug (one org spans all three GitHub
+          # namespaces). Provisional org created 2026-08-07; if it is ever
+          # renamed, this is the one central line to update.
+          socket scan create \
+            --org=demo-i61vr \
+            --report \
+            --report-level=error \
+            --no-interactive \
+            --repo="$repo_name" \
+            --branch="$GITHUB_HEAD_REF" \
+            .
+      # non-blocking during the tuning window; promote to blocking after ~2 weeks
+      # (decided Toby 2026-08-07, REVISIT 2026-08-21).
+      - name: Semgrep CE (SAST, advisory)
+        run: |
+          pip install semgrep==1.172.0
+          semgrep scan \
+            --error \
+            --config p/python \
+            --config p/javascript \
+            --config p/typescript \
+            --config p/dockerfile \
+            --config p/github-actions \
+            --exclude='**/.venv/**' \
+            --exclude='**/node_modules/**' \
+            --exclude='**/target/**' \
+            --exclude='**/tests/fixtures/**' \
+            --exclude='**/test/fixtures/**' \
+            .
+        continue-on-error: true
+      # Pin-and-verify is standing process after Trivy's March 2026 release-pipeline compromise.
+      # No `trivy fs` here: OSV-Scanner in dependency-scan owns lockfile vulns.
+      # non-blocking during the tuning window; promote to blocking after ~2 weeks
+      # (decided Toby 2026-08-07, REVISIT 2026-08-21).
+      - name: Trivy config (IaC / Dockerfile misconfig, advisory)
+        if: needs.detect.outputs.iac == 'true'
+        run: |
+          VER=0.73.0
+          ARCHIVE="trivy_${VER}_Linux-64bit.tar.gz"
+          CHECKSUMS="trivy_${VER}_checksums.txt"
+          TRIVY_SHA256=2edd39da482bb4e9831962487b68f68e3928ec3137794757f54d00383d79547b
+          RELEASE_URL="https://github.com/aquasecurity/trivy/releases/download/v${VER}"
+          curl -sSfL "${RELEASE_URL}/${ARCHIVE}" -o "$ARCHIVE"
+          curl -sSfL "${RELEASE_URL}/${CHECKSUMS}" -o "$CHECKSUMS"
+          published_sha=$(awk -v archive="$ARCHIVE" '$2 == archive { print $1 }' "$CHECKSUMS")
+          if [ "$published_sha" != "$TRIVY_SHA256" ]; then
+            echo "::error::Official Trivy checksum does not match the pinned SHA256"
+            exit 1
+          fi
+          if ! printf '%s  %s\n' "$published_sha" "$ARCHIVE" | sha256sum --check --strict -; then
+            echo "::error::Trivy archive SHA256 verification failed"
+            exit 1
+          fi
+          tar -xzf "$ARCHIVE" trivy
+          ./trivy config --exit-code 1 .
+        continue-on-error: true
 
   # Session-link hygiene — BLOCKING. Claude sessions must not leak
   # Claude-Session trailers / claude.ai/code URLs into public commit history
