@@ -7,6 +7,12 @@ Reusable GitHub Actions workflows (CI + release) shared by my public projects.
 
 `v1` is a rolling tag: callers pin `@v1` and pick up fixes when the tag moves. Breaking changes get a new major tag.
 
+## Socket configuration
+
+To enable Socket scans, pass the `SOCKET_SECURITY_API_KEY` secret. Scans use
+the shared public Socket organization `demo-i61vr`. Callers without the API key
+continue to skip Socket.
+
 ## License
 
 MIT

@@ -3,8 +3,7 @@
 # via a ~6-line caller:
 #   jobs: { ci: { uses: tobyrosen/oss-workflows/.github/workflows/ci.yml@v1 } }
 #
-# This is the structural end of the copy-propagation churn: CI logic changes
-# here ONCE; callers pin @v1 so nothing moves in them until the tag is bumped.
+# CI logic is maintained here; callers use the rolling @v1 tag.
 #
 # Runs:
 #   - secrets scan (gitleaks) — BLOCKING
@@ -90,7 +89,6 @@ jobs:
   # whose existing code predated the gate. Secrets block via the `secrets` job
   # above; build via the language jobs; vulns via dependency-scan. This is the
   # gate right-size — style is a local convenience, not a merge gate.
-  # (Toby, 2026-06-05: kill the fleet-wide CI churn.)
   pre-commit:
     # Cancel superseded PR runs (cost cut): group per repo+ref+job so a
     # new push to the same PR ref cancels the in-flight run instead of
@@ -244,14 +242,13 @@ jobs:
     runs-on: ubuntu-latest
     # OSV-Scanner (Google) scans lockfiles against the OSV.dev vulnerability DB.
     # Replaces dependency-review-action, which requires GitHub Advanced Security
-    # (Dependency Graph + Code Security). GHAS is unavailable on the AsiaProGolf org
-    # AND on personal private repos, so dependency-review red-X'd every PR there.
+    # (Dependency Graph + Code Security), which may be unavailable to callers.
     # OSV-Scanner is free and runs on ANY repo — public, private, any org — with no
     # GHAS dependency. We use the COMPOSITE action (not the reusable PR workflow):
     # the reusable workflow uploads SARIF to the Security tab, which on private repos
     # is itself a GHAS feature and would hit the same wall. The composite action runs
     # the scanner in-container, prints findings to the job log, and fails the job on
-    # any known vuln. (Toby, 2026-06-05: keep a working check everywhere, don't skip.)
+    # any known vulnerability.
     # NOTE: scans the whole lockfile and fails on any severity — stricter than the old
     # fail-on-severity:high diff gate. Add a .osv-scanner.toml allowlist for false
     # positives. Docs: https://google.github.io/osv-scanner/github-action/
@@ -261,8 +258,7 @@ jobs:
       # Repo-level allowlist (osv-scanner.toml at repo root) must be passed via
       # --config to apply GLOBALLY: auto-discovered configs are directory-local
       # and never reach nested lockfiles (e.g. src-tauri/Cargo.lock). Entries
-      # require a reason + owner review date. (Fixed 2026-08-04; mirrors the
-      # fleet-ci central-floor+appendix fix.)
+      # require a reason and review date.
       - name: Prepare OSV-Scanner config
         run: |
           if [ ! -f "$GITHUB_WORKSPACE/osv-scanner.toml" ]; then
@@ -275,16 +271,14 @@ jobs:
             --config /github/workspace/osv-scanner.toml
             ./
 
-  # Two fleet security layers share one PR-only job to avoid the per-job
+  # Two security scanners share one job to avoid the per-job
   # 1-minute billing minimum. Socket blocks when configured; Semgrep blocks.
   # Socket free tier = 1,000 scans/mo, which is why this is PR-only.
-  # Semgrep blocking since 2026-08-19; Trivy config scan removed 2026-08-19
-  # (no IaC in fleet callers; VPS weekly image scan retained).
   security-scan:
     # Cancel superseded PR runs (cost cut): group per repo+ref+job so a
     # new push to the same PR ref cancels the in-flight run instead of
     # billing it to completion. Scoped to pull_request only — main-push
-    # runs are never cancelled (the mrfixcode-gate consumes them).
+    # runs are never cancelled (downstream automation consumes them).
     concurrency:
       group: ci-security-scan-${{ github.repository }}-${{ github.ref }}
       cancel-in-progress: ${{ github.event_name == 'pull_request' }}
@@ -303,9 +297,7 @@ jobs:
           fi
           npm install --global socket@1.1.147
           repo_name=${GITHUB_REPOSITORY#*/}
-          # --org: Socket-side org slug (one org spans all three GitHub
-          # namespaces). Provisional org created 2026-08-07; if it is ever
-          # renamed, this is the one central line to update.
+          # --org: public Socket organization slug shared by callers.
           socket scan create \
             --org=demo-i61vr \
             --report \
@@ -314,14 +306,12 @@ jobs:
             --repo="$repo_name" \
             --branch="$GITHUB_HEAD_REF" \
             .
-      # BLOCKING since 2026-08-19 (Toby-approved) — ends the 2026-08-07 advisory
-      # tuning window. `--error` already exits non-zero on a finding; dropping
-      # continue-on-error is what turns that into a failed job.
+      # --error exits non-zero on a finding, failing this job.
       #
-      # EXACTLY ONE rule is excluded, fleet-wide, by rule id:
+      # One rule is excluded by rule id:
       #   yaml.github-actions.security.secrets-inherit.secrets-inherit
       # Why: it fires on `secrets: inherit` in a caller's own workflow file, which
-      # is precisely how a fleet caller hands SOCKET_SECURITY_API_KEY to THIS
+      # is how a caller passes SOCKET_SECURITY_API_KEY to this
       # shared workflow. It flags our own CI wiring, not the repo's code.
       # Excluded by rule id rather than by path so every other finding under
       # .github/workflows/ still blocks. REVISIT 2026-10-01.
@@ -345,7 +335,7 @@ jobs:
 
   # Session-link hygiene — BLOCKING. Claude sessions must not leak
   # Claude-Session trailers / claude.ai/code URLs into public commit history
-  # (fleet rule, Toby 2026-07-31). PR-only, like dependency-scan.
+  # Runs on pull requests, like dependency-scan.
   session-links:
     # Cancel superseded PR runs (cost cut): group per repo+ref+job so a
     # new push to the same PR ref cancels the in-flight run instead of
