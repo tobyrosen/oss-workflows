@@ -110,7 +110,7 @@ jobs:
           python-version: "3.12"
       # Node is only needed for the JS/TS lint hooks (eslint); skip it on
       # Python/Rust-only repos so they don't pull an unused toolchain.
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         if: needs.detect.outputs.js == 'true'
         with:
           node-version: "22"
@@ -193,7 +193,7 @@ jobs:
     if: needs.detect.outputs.js == 'true'
     steps:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
-      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6.5.0
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
         with:
           node-version: "22"
           cache: "npm"
